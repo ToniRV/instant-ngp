@@ -392,10 +392,10 @@ PYBIND11_MODULE(pyngp, m) {
 
 	py::class_<Testbed> testbed(m, "Testbed");
 	testbed
-		.def(py::init<ETestbedMode>())
-		.def(py::init<ETestbedMode, const std::string&, const std::string&>())
-		.def(py::init<ETestbedMode, const std::string&, const json&>())
-		.def("create_empty_nerf_dataset", &Testbed::create_empty_nerf_dataset, "Allocate memory for a nerf dataset with a given size", py::arg("n_images"), py::arg("aabb_scale")=1, py::arg("is_hdr")=false)
+		.def(py::init<ETestbedMode, int>())
+		.def(py::init<ETestbedMode, int, const std::string&, const std::string&>())
+		.def(py::init<ETestbedMode, int, const std::string&, const json&>())
+		.def("create_empty_nerf_dataset", &Testbed::create_empty_nerf_dataset, "Allocate memory for a nerf dataset with a given size", py::arg("n_images"), py::arg("nerf_scale"), py::arg("nerf_offset"), py::arg("aabb_scale"), py::arg("render_aabb"), py::arg("is_hdr")=false)
 		.def("load_training_data", &Testbed::load_training_data, py::call_guard<py::gil_scoped_release>(), "Load training data from a given path.")
 		.def("clear_training_data", &Testbed::clear_training_data, "Clears training data to free up GPU memory.")
 		// General control

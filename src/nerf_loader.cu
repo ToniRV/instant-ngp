@@ -570,7 +570,7 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 				info,
 				rolling_shutter,
 				principal_point,
-				camera_distortion,
+				lens,
 				part_after_underscore,
 				fix_premult,
 				enable_depth_loading,
@@ -780,11 +780,11 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 					// set these from the base settings
 					result.metadata[i_img].rolling_shutter = rolling_shutter;
 					result.metadata[i_img].principal_point = principal_point;
-					result.metadata[i_img].camera_distortion = camera_distortion;
+					result.metadata[i_img].lens = lens;
 					// see if there is a per-frame override
-					read_camera_distortion(
+					read_lens(
 						frame,
-						result.metadata[i_img].camera_distortion,
+						result.metadata[i_img].lens,
 						result.metadata[i_img].principal_point,
 						result.metadata[i_img].rolling_shutter);
 

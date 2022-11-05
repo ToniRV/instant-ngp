@@ -37,7 +37,7 @@ struct TrainingImageMetadata {
 	const float* depth_cov = nullptr;
 	const Ray* rays = nullptr;
 
-	CameraDistortion camera_distortion = {};
+	Lens lens = {};
 	Eigen::Vector2i resolution = Eigen::Vector2i::Zero(); // TODO: when calling set_camera_intrinsics, since this is 0, principal_point becomes inf.
 	Eigen::Vector2f principal_point = Eigen::Vector2f::Constant(0.5f);
 	Eigen::Vector2f focal_length = Eigen::Vector2f::Constant(1000.f);
