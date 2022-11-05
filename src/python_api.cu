@@ -46,25 +46,84 @@ using namespace pybind11::literals; // to bring in the `_a` literal
 
 NGP_NAMESPACE_BEGIN
 
+void Testbed::Nerf::Training::update_training_images(
+	const std::vector<uint32_t>& frame_ids, 			  // (N,1)
+	const std::vector<Eigen::Matrix<float, 3, 4>>& poses, // (N,3,4)
+	const std::vector<pybind11::array_t<float>>& images,                    // (N,H,W,4)
+	const std::vector<pybind11::array_t<float>>& depths,                      // (N,H,W,3)
+	const std::vector<pybind11::array_t<float>>& depths_cov,                  // (N,H,W,3)
+	const Eigen::Vector2i& resolution,                    // (W,H)
+	const Eigen::Vector2f& principal_point,               // (cx,cy)
+	const Eigen::Vector2f& focal_length,                  // (fx,fy)
+	float depth_scale,
+	float depth_cov_scale) {
 
-void Testbed::Nerf::Training::set_image(int frame_idx, pybind11::array_t<float> img, pybind11::array_t<float> depth_img, float depth_scale) {
-	if (frame_idx < 0 || frame_idx >= dataset.n_images) {
-		throw std::runtime_error{"Invalid frame index"};
+	for (int i = 0; i < frame_ids.size(); i++) {
+		const int& frame_id = frame_ids[i];
+		pybind11::array_t<float> image = images[i];
+		pybind11::array_t<float> depth = depths[i];
+		pybind11::array_t<float> depth_cov = depths_cov[i];
+
+		if (n_images_for_training < dataset.n_images) {
+			if (ref_frames.find(frame_id) == ref_frames.end()) {
+				// Only add +1 for new frames, not for old frames for which we update its properties.
+				n_images_for_training += 1;
+			}
+			ref_frames[frame_id] = 0; // to keep track of which frames are new.
+		}
+
+		// Img Data
+		set_image(frame_id, image, depth, depth_cov, depth_scale, depth_cov_scale);
+
+        // Intrinsics
+		float fx = focal_length.x();
+		float fy = focal_length.y();
+		float cx = principal_point.x();
+		float cy = principal_point.y();
+		float k1 = 0.f, k2 = 0.f, p1 = 0.f, p2 = 0.f;
+		set_camera_intrinsics(frame_id, fx, fy, cx, cy, k1, k2, p1, p2);
+
+		// Extrinsics
+		bool convert_to_ngp = false;
+		const auto& pose = poses[i];
+		set_camera_extrinsics(frame_id, pose, convert_to_ngp);
 	}
+}
 
-	py::buffer_info img_buf = img.request();
+void Testbed::Nerf::Training::set_image(int frame_idx,
+                                        pybind11::array_t<float> img,
+                                        pybind11::array_t<float> depth_img,
+                                        pybind11::array_t<float> depth_cov,
+                                        float depth_scale,
+                                        float depth_cov_scale) {
+  if (frame_idx < 0 || frame_idx >= dataset.n_images) {
+    throw std::runtime_error{"Invalid frame index"};
+  }
 
-	if (img_buf.ndim != 3) {
-		throw std::runtime_error{"image should be (H,W,C) where C=4"};
-	}
+  py::buffer_info img_buf = img.request();
 
-	if (img_buf.shape[2] != 4) {
-		throw std::runtime_error{"image should be (H,W,C) where C=4"};
-	}
+  if (img_buf.ndim != 3) {
+    throw std::runtime_error{"image should be (H,W,C) where C=4"};
+  }
 
-	py::buffer_info depth_buf = depth_img.request();
+  if (img_buf.shape[2] != 4) {
+    throw std::runtime_error{"image should be (H,W,C) where C=4"};
+  }
 
-	dataset.set_training_image(frame_idx, {img_buf.shape[1], img_buf.shape[0]}, (const void*)img_buf.ptr, (const float*)depth_buf.ptr, depth_scale, false, EImageDataType::Float, EDepthDataType::Float);
+  py::buffer_info depth_buf = depth_img.request();
+  py::buffer_info depth_cov_buf = depth_cov.request();
+
+  dataset.set_training_image(frame_idx,
+                             {img_buf.shape[1], img_buf.shape[0]},
+                             (const void*)img_buf.ptr,
+                             (const float*)depth_buf.ptr,
+                             (const float*)depth_cov_buf.ptr,
+                             depth_scale,
+                             depth_cov_scale,
+                             false,
+                             EImageDataType::Float,
+                             EDepthDataType::Float,
+                             EDepthDataType::Float);
 }
 
 void Testbed::override_sdf_training_data(py::array_t<float> points, py::array_t<float> distances) {
@@ -132,27 +191,16 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 	if (end_time < 0.f) {
 		end_time = start_time;
 	}
-	bool path_animation_enabled = start_time >= 0.f;
-	if (!path_animation_enabled) { // the old code disabled camera smoothing for non-path renders; so we preserve that behaviour
-		m_smoothed_camera = m_camera;
-	}
 
-	// this rendering code assumes that the intra-frame camera motion starts from m_smoothed_camera (ie where we left off) to allow for EMA camera smoothing.
-	// in the case of a camera path animation, at the very start of the animation, we have yet to initialize smoothed_camera to something sensible
-	// - it will just be the default boot position. oops!
-	// that led to the first frame having a crazy streak from the default camera position to the start of the path.
-	// so we detect that case and explicitly force the current matrix to the start of the path
-	if (start_time == 0.f) {
-		set_camera_from_time(start_time);
-		m_smoothed_camera = m_camera;
-	}
 	auto start_cam_matrix = m_smoothed_camera;
 
-	// now set up the end-of-frame camera matrix if we are moving along a path
-	if (path_animation_enabled) {
+	if (start_time >= 0.f) {
 		set_camera_from_time(end_time);
 		apply_camera_smoothing(1000.f / fps);
+	} else {
+		start_cam_matrix = m_smoothed_camera = m_camera;
 	}
+
 	auto end_cam_matrix = m_smoothed_camera;
 
 	for (int i = 0; i < spp; ++i) {
@@ -162,7 +210,7 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 		auto sample_start_cam_matrix = log_space_lerp(start_cam_matrix, end_cam_matrix, start_alpha);
 		auto sample_end_cam_matrix = log_space_lerp(start_cam_matrix, end_cam_matrix, end_alpha);
 
-		if (path_animation_enabled) {
+		if (start_time >= 0.f) {
 			set_camera_from_time(start_time + (end_time-start_time) * (start_alpha + end_alpha) / 2.0f);
 			m_smoothed_camera = m_camera;
 		}
@@ -180,7 +228,15 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 	py::array_t<float> result({height, width, 4});
 	py::buffer_info buf = result.request();
 
-	CUDA_CHECK_THROW(cudaMemcpy2DFromArray(buf.ptr, width * sizeof(float) * 4, m_windowless_render_surface.surface_provider().array(), 0, 0, width * sizeof(float) * 4, height, cudaMemcpyDeviceToHost));
+	CUDA_CHECK_THROW(cudaMemcpy2DFromArray(
+		buf.ptr,
+		width * sizeof(float) * 4,
+		m_windowless_render_surface.surface_provider().array(),
+		0,
+		0,
+		width * sizeof(float) * 4,
+		height,
+		cudaMemcpyDeviceToHost));
 	return result;
 }
 
@@ -380,6 +436,7 @@ PYBIND11_MODULE(pyngp, m) {
 			py::arg("spp") = 1,
 			py::arg("linear") = true
 		)
+		.def("apply_camera_smoothing", &Testbed::apply_camera_smoothing, py::arg("elapsed_time"), "Apply cam smoothin")
 		.def("destroy_window", &Testbed::destroy_window, "Destroy the window again.")
 		.def("train", &Testbed::train, py::call_guard<py::gil_scoped_release>(), "Perform a specified number of training steps.")
 		.def("reset", &Testbed::reset_network, py::arg("reset_density_grid") = true, "Reset training.")
@@ -487,6 +544,7 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("visualized_layer", &Testbed::m_visualized_layer)
 		.def_property_readonly("loss", [](py::object& obj) { return obj.cast<Testbed&>().m_loss_scalar.val(); })
 		.def_readonly("training_step", &Testbed::m_training_step)
+		.def_readonly("elapsed_training_time", &Testbed::m_elapsed_training_time)
 		.def_readonly("nerf", &Testbed::m_nerf)
 		.def_readonly("sdf", &Testbed::m_sdf)
 		.def_readonly("image", &Testbed::m_image)
@@ -568,6 +626,7 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readwrite("principal_point", &TrainingImageMetadata::principal_point)
 		.def_readwrite("rolling_shutter", &TrainingImageMetadata::rolling_shutter)
 		.def_readwrite("light_dir", &TrainingImageMetadata::light_dir)
+		.def_readwrite("resolution", &TrainingImageMetadata::resolution)
 		;
 
 	py::class_<NerfDataset> nerfdataset(m, "NerfDataset");
@@ -615,8 +674,8 @@ PYBIND11_MODULE(pyngp, m) {
 		.def_readonly("dataset", &Testbed::Nerf::Training::dataset)
 		.def("set_camera_intrinsics", &Testbed::Nerf::Training::set_camera_intrinsics,
 			py::arg("frame_idx"),
-			py::arg("fx")=0.f, py::arg("fy")=0.f,
-			py::arg("cx")=-0.5f, py::arg("cy")=-0.5f,
+			py::arg("fx"), py::arg("fy"),
+			py::arg("cx"), py::arg("cy"),
 			py::arg("k1")=0.f, py::arg("k2")=0.f,
 			py::arg("p1")=0.f, py::arg("p2")=0.f,
 			"Set up the camera intrinsics for the given training image index."
@@ -628,13 +687,21 @@ PYBIND11_MODULE(pyngp, m) {
 			"Set up the camera extrinsics for the given training image index, from the given 3x4 transformation matrix."
 		)
 		.def("get_camera_extrinsics", &Testbed::Nerf::Training::get_camera_extrinsics, py::arg("frame_idx"), "return the 3x4 transformation matrix of given training frame")
+
+		.def("update_training_images", &Testbed::Nerf::Training::update_training_images,
+			 "Update a set of pose/img/depths in training dataset",
+			py::arg("frame_ids"), py::arg("poses"), py::arg("images"), py::arg("depths"), py::arg("depths_cov"),
+			py::arg("resolution"), py::arg("principal_point"), py::arg("focal_length"),
+			py::arg("depth_scale"), py::arg("depth_cov_scale"))
+
 		.def("set_image", &Testbed::Nerf::Training::set_image,
 			py::arg("frame_idx"),
 			py::arg("img"),
 			py::arg("depth_img"),
+			py::arg("depth_cov"),
 			py::arg("depth_scale")=1.0f,
-			"set one of the training images. must be a floating point numpy array of (H,W,C) with 4 channels; linear color space; W and H must match image size of the rest of the dataset"
-		)
+			py::arg("depth_cov_scale")=1.0f,
+			"Set one of the training images. Must be a floating point numpy array of (H,W,C) with 4 channels; linear color space; W and H must match image size of the rest of the dataset")
 		;
 
 	py::class_<Testbed::Sdf> sdf(testbed, "Sdf");

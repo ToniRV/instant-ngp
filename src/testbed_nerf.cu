@@ -1302,6 +1302,7 @@ __global__ void compute_loss_kernel_train_nerf(
 	const Eigen::Array3f* __restrict__ exposure,
 	Eigen::Array3f* __restrict__ exposure_gradient,
 	float depth_supervision_lambda,
+	float depth_noise,
 	float near_distance
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -1424,8 +1425,16 @@ __global__ void compute_loss_kernel_train_nerf(
 	lg.loss /= img_pdf * xy_pdf;
 
 	float target_depth = rays_in_unnormalized[i].d.norm() * ((depth_supervision_lambda > 0.0f && metadata[img].depth) ? read_depth(xy, resolution, metadata[img].depth) : -1.0f);
+	target_depth += depth_noise * rng.next_double();
+
+	// printf("Rays in unnormalized.d.norm(): %.6f\n", rays_in_unnormalized[i].d.norm());
+	// Given the change of coords above, from a depth on z, to a depth on ray, we need to change the covariances accordingly:
+	float target_depth_cov = ((depth_supervision_lambda > 0.0f && metadata[img].depth_cov) ?
+		rays_in_unnormalized[i].d.norm() * read_depth(xy, resolution, metadata[img].depth_cov) : 1.0f);
+
 	LossAndGradient lg_depth = loss_and_gradient(Array3f::Constant(target_depth), Array3f::Constant(depth_ray), depth_loss_type);
-	float depth_loss_gradient = target_depth > 0.0f ? depth_supervision_lambda * lg_depth.gradient.x() : 0;
+	float depth_loss_gradient = target_depth > 0.0f ? depth_supervision_lambda * lg_depth.gradient.x() / target_depth_cov : 0;
+	//printf("Depth Gradient: %.6f\n", depth_loss_gradient);
 
 	// Note: dividing the gradient by the PDF would cause unbiased loss estimates.
 	// Essentially: variance reduction, but otherwise the same optimization.
@@ -1641,20 +1650,20 @@ __global__ void compute_cam_gradient_train_nerf(
 		ray_gradient.d += pos_gradient * t + dir_gradient;
 	}
 
+	// Projection of the raydir gradient onto the plane normal to raydir,
+	// because that's the only degree of motion that the raydir has.
+	ray_gradient.d -= ray.d * ray_gradient.d.dot(ray.d);
+
 	rng.advance(ray_idx * N_MAX_RANDOM_SAMPLES_PER_RAY());
 	float xy_pdf = 1.0f;
 
 	Vector2f xy = nerf_random_image_pos_training(rng, resolution, snap_to_pixel_centers, cdf_x_cond_y, cdf_y, error_map_res, img, &xy_pdf);
 
 	if (distortion_gradient) {
-		// Projection of the raydir gradient onto the plane normal to raydir,
-		// because that's the only degree of motion that the raydir has.
-		Vector3f orthogonal_ray_gradient = ray_gradient.d - ray.d * ray_gradient.d.dot(ray.d);
-
 		// Rotate ray gradient to obtain image plane gradient.
 		// This has the effect of projecting the (already projected) ray gradient from the
 		// tangent plane of the sphere onto the image plane (which is correct!).
-		Vector3f image_plane_gradient = xform.block<3,3>(0,0).inverse() * orthogonal_ray_gradient;
+		Vector3f image_plane_gradient = xform.block<3,3>(0,0).inverse() * ray_gradient.d;
 
 		// Splat the resulting 2D image plane gradient into the distortion params
 		deposit_image_gradient<2>(image_plane_gradient.head<2>() / xy_pdf, distortion_gradient, distortion_gradient_weight, distortion_resolution, xy);
@@ -2382,7 +2391,7 @@ void Testbed::render_nerf(CudaRenderBuffer& render_buffer, const Vector2i& max_r
 
 void Testbed::Nerf::Training::set_camera_intrinsics(int frame_idx, float fx, float fy, float cx, float cy, float k1, float k2, float p1, float p2) {
 	if (frame_idx < 0 || frame_idx >= dataset.n_images) {
-		return;
+	throw std::runtime_error{"Invalid frame index"};
 	}
 	if (fx <= 0.f) fx = fy;
 	if (fy <= 0.f) fy = fx;
@@ -2398,7 +2407,7 @@ void Testbed::Nerf::Training::set_camera_intrinsics(int frame_idx, float fx, flo
 
 void Testbed::Nerf::Training::set_camera_extrinsics_rolling_shutter(int frame_idx, Eigen::Matrix<float, 3, 4> camera_to_world_start, Eigen::Matrix<float, 3, 4> camera_to_world_end, const Vector4f& rolling_shutter, bool convert_to_ngp) {
 	if (frame_idx < 0 || frame_idx >= dataset.n_images) {
-		return;
+	throw std::runtime_error{"Invalid frame index"};
 	}
 
 	if (convert_to_ngp) {
@@ -2513,11 +2522,10 @@ void Testbed::Nerf::Training::update_transforms(int first, int last) {
 	CUDA_CHECK_THROW(cudaMemcpy(transforms_gpu.data() + first, transforms.data() + first, n * sizeof(TrainingXForm), cudaMemcpyHostToDevice));
 }
 
-void Testbed::create_empty_nerf_dataset(size_t n_images, int aabb_scale, bool is_hdr) {
+void Testbed::create_empty_nerf_dataset(size_t n_images, float nerf_scale, Eigen::Vector3f nerf_offset, int aabb_scale, BoundingBox render_aabb, bool is_hdr) {
 	m_data_path = {};
-	m_nerf.training.dataset = ngp::create_empty_nerf_dataset(n_images, aabb_scale, is_hdr);
-	load_nerf();
-	m_nerf.training.n_images_for_training = 0;
+	m_nerf.training.dataset = ngp::create_empty_nerf_dataset(n_images, nerf_scale, nerf_offset, aabb_scale, render_aabb, is_hdr);
+	load_nerf_post();
 	m_training_data_available = true;
 }
 
@@ -2558,18 +2566,8 @@ void Testbed::load_nerf_post() { // moved the second half of load_nerf here
 	// m_nerf.training.dataset.camera = {};
 
 	// Perturbation of the training cameras -- for debugging the online extrinsics learning code
-	float perturb_amount = 0.0f;
-	if (perturb_amount > 0.f) {
-		for (uint32_t i = 0; i < m_nerf.training.dataset.n_images; ++i) {
-			Vector3f rot = random_val_3d(m_rng) * perturb_amount;
-			float angle = rot.norm();
-			rot /= angle;
-			auto trans = random_val_3d(m_rng);
-			m_nerf.training.dataset.xforms[i].start.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * m_nerf.training.dataset.xforms[i].start.block<3,3>(0,0);
-			m_nerf.training.dataset.xforms[i].start.col(3) += trans * perturb_amount;
-			m_nerf.training.dataset.xforms[i].end.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * m_nerf.training.dataset.xforms[i].end.block<3,3>(0,0);
-			m_nerf.training.dataset.xforms[i].end.col(3) += trans * perturb_amount;
-		}
+	if (m_nerf.training.perturb_pose_amount > 0.f) {
+		perturb_poses(m_nerf.training.perturb_pose_amount);
 	}
 
 	m_nerf.training.update_transforms();
@@ -2611,6 +2609,45 @@ void Testbed::load_nerf_post() { // moved the second half of load_nerf here
 	m_nerf.cone_angle_constant = m_nerf.training.dataset.aabb_scale <= 1 ? 0.0f : (1.0f / 256.0f);
 
 	m_up_dir = m_nerf.training.dataset.up;
+}
+
+// This modifies the optimized transformation from initial pose to current pose
+void Testbed::perturb_transforms(float perturb_amount) {
+	uint32_t n = m_nerf.training.dataset.n_images;
+	for (uint32_t i = 0; i < n; ++i) {
+		auto xform = m_nerf.training.dataset.xforms[i];
+
+		Vector3f rot = random_val_3d(m_rng) * perturb_amount;
+		float angle = rot.norm();
+		rot /= angle;
+		auto trans = random_val_3d(m_rng);
+
+		xform.start.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * xform.start.block<3,3>(0,0);
+		xform.start.col(3) += trans * perturb_amount;
+		xform.end.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * xform.end.block<3,3>(0,0);
+		xform.end.col(3) += trans * perturb_amount;
+
+		m_nerf.training.transforms[i] = xform;
+	}
+
+	m_nerf.training.transforms_gpu.enlarge(n);
+	CUDA_CHECK_THROW(cudaMemcpy(m_nerf.training.transforms_gpu.data(),
+								m_nerf.training.transforms.data(),
+								n * sizeof(TrainingXForm), cudaMemcpyHostToDevice));
+}
+
+// This modifies the ground-truth/initial pose
+void Testbed::perturb_poses(float perturb_amount) {
+	for (uint32_t i = 0; i < m_nerf.training.dataset.n_images; ++i) {
+		Vector3f rot = random_val_3d(m_rng) * perturb_amount;
+		float angle = rot.norm();
+		rot /= angle;
+		auto trans = random_val_3d(m_rng);
+		m_nerf.training.dataset.xforms[i].start.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * m_nerf.training.dataset.xforms[i].start.block<3,3>(0,0);
+		m_nerf.training.dataset.xforms[i].start.col(3) += trans * perturb_amount;
+		m_nerf.training.dataset.xforms[i].end.block<3,3>(0,0) = AngleAxisf(angle, rot).matrix() * m_nerf.training.dataset.xforms[i].end.block<3,3>(0,0);
+		m_nerf.training.dataset.xforms[i].end.col(3) += trans * perturb_amount;
+	}
 }
 
 void Testbed::load_nerf() {
@@ -3188,6 +3225,7 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 		m_nerf.training.cam_exposure_gpu.data(),
 		m_nerf.training.optimize_exposure ? m_nerf.training.cam_exposure_gradient_gpu.data() : nullptr,
 		m_nerf.training.depth_supervision_lambda,
+		m_nerf.training.perturb_depth_amount,
 		m_nerf.training.near_distance
 	);
 
