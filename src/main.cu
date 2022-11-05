@@ -164,7 +164,8 @@ int main(int argc, char** argv) {
 			}
 		}
 
-		Testbed testbed{mode};
+		int device = 0;
+		Testbed testbed{mode, device};
 
 		if (scene_flag) {
 			fs::path scene_path = get(scene_flag);

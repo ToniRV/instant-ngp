@@ -269,7 +269,10 @@ void Testbed::next_training_view() {
 
 void Testbed::set_camera_to_training_view(int trainview) {
 	auto old_look_at = look_at();
-	m_camera = m_smoothed_camera = get_xform_given_rolling_shutter(m_nerf.training.transforms[trainview], m_nerf.training.dataset.metadata[trainview].rolling_shutter, Vector2f{0.5f, 0.5f}, 0.0f);
+	m_camera = get_xform_given_rolling_shutter(m_nerf.training.transforms[trainview], m_nerf.training.dataset.metadata[trainview].rolling_shutter, Vector2f{0.5f, 0.5f}, 0.0f);
+	if (!m_camera_smoothing) {
+		m_smoothed_camera = m_camera;
+	}
 	m_relative_focal_length = m_nerf.training.dataset.metadata[trainview].focal_length / (float)m_nerf.training.dataset.metadata[trainview].resolution[m_fov_axis];
 	m_scale = std::max((old_look_at - view_pos()).dot(view_dir()), 0.1f);
 	m_nerf.render_with_lens_distortion = true;
@@ -553,8 +556,8 @@ void Testbed::imgui() {
 		if (m_testbed_mode == ETestbedMode::Nerf) {
 			ImGui::Text("Rays/batch: %d, Samples/ray: %.2f, Batch size: %d/%d", m_nerf.training.counters_rgb.rays_per_batch, (float)m_nerf.training.counters_rgb.measured_batch_size / (float)m_nerf.training.counters_rgb.rays_per_batch, m_nerf.training.counters_rgb.measured_batch_size, m_nerf.training.counters_rgb.measured_batch_size_before_compaction);
 		}
-		float elapsed_training = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_training_start_time_point).count();
-		ImGui::Text("Steps: %d, Loss: %0.6f (%0.2f dB), Elapsed: %.1fs", m_training_step, m_loss_scalar.ema_val(), linear_to_db(m_loss_scalar.ema_val()), elapsed_training);
+		m_elapsed_training_time = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_training_start_time_point).count();
+		ImGui::Text("Steps: %d, Loss: %0.6f (%0.2f dB), Elapsed: %.1fs", m_training_step, m_loss_scalar.ema_val(), linear_to_db(m_loss_scalar.ema_val()), m_elapsed_training_time);
 		ImGui::PlotLines("loss graph", m_loss_graph.data(), std::min(m_loss_graph_samples, m_loss_graph.size()), (m_loss_graph_samples < m_loss_graph.size()) ? 0 : (m_loss_graph_samples % m_loss_graph.size()), 0, FLT_MAX, FLT_MAX, ImVec2(0, 50.f));
 
 		if (m_testbed_mode == ETestbedMode::Nerf && ImGui::TreeNode("NeRF training options")) {
@@ -562,6 +565,10 @@ void Testbed::imgui() {
 			ImGui::SameLine();
 			ImGui::Checkbox("Snap to pixel centers", &m_nerf.training.snap_to_pixel_centers);
 			ImGui::SliderFloat("Near distance", &m_nerf.training.near_distance, 0.0f, 1.0f);
+			if (ImGui::SliderFloat("Initial Pose Perturbation", &m_nerf.training.perturb_pose_amount, 0.0f, 1.0f)) {
+				perturb_poses(m_nerf.training.perturb_pose_amount);
+			}
+			ImGui::SliderFloat("Depth Noise Perturbation", &m_nerf.training.perturb_depth_amount, 0.0f, 1.0f);
 			accum_reset |= ImGui::Checkbox("Linear colors", &m_nerf.training.linear_colors);
 			ImGui::Combo("Loss", (int*)&m_nerf.training.loss_type, LossTypeStr);
 			ImGui::Combo("Depth Loss", (int*)&m_nerf.training.depth_loss_type, LossTypeStr);
@@ -1666,7 +1673,7 @@ void Testbed::train_and_render(bool skip_rendering) {
 		optimise_mesh_step(1);
 	}
 
-	apply_camera_smoothing(m_frame_ms.val());
+	// apply_camera_smoothing(m_frame_ms.val());
 
 	if (!m_render_window || !m_render || skip_rendering) {
 		return;
@@ -2466,9 +2473,13 @@ void Testbed::reset_network(bool clear_density_grid) {
 	}
 }
 
-Testbed::Testbed(ETestbedMode mode)
+Testbed::Testbed(ETestbedMode mode, int device)
 : m_testbed_mode(mode)
 {
+	CUDA_CHECK_THROW(cudaSetDevice(device));
+	tcnn::set_cuda_device(device);
+	tlog::success() << "NGP Device set to: " << tcnn::cuda_device();
+
 	uint32_t compute_capability = cuda_compute_capability();
 	if (compute_capability < MIN_GPU_ARCH) {
 		tlog::warning() << "Insufficient compute capability " << compute_capability << " detected.";

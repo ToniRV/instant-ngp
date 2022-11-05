@@ -172,21 +172,29 @@ bool ends_with(const std::string& str, const std::string& suffix) {
 	return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
 }
 
-NerfDataset create_empty_nerf_dataset(size_t n_images, int aabb_scale, bool is_hdr) {
+NerfDataset create_empty_nerf_dataset(size_t n_images, float nerf_scale, Eigen::Vector3f nerf_offset, int aabb_scale, BoundingBox render_aabb, bool is_hdr) {
 	NerfDataset result{};
 	result.n_images = n_images;
 	result.sharpness_resolution = { 128, 72 };
 	result.sharpness_data.enlarge( result.sharpness_resolution.x() * result.sharpness_resolution.y() *  result.n_images );
-	result.xforms.resize(n_images);
+	result.paths = std::vector<std::string>(n_images, "");
 	result.metadata.resize(n_images);
 	result.pixelmemory.resize(n_images);
 	result.depthmemory.resize(n_images);
+	result.depthcovmemory.resize(n_images);
 	result.raymemory.resize(n_images);
-	result.scale = NERF_SCALE;
-	result.offset = {0.5f, 0.5f, 0.5f};
-	result.aabb_scale = aabb_scale;
+	result.scale = nerf_scale;
+	result.up = {0.0f, 1.0f, 0.0f};
+	result.offset = nerf_offset;
+	result.from_mitsuba = false;
 	result.is_hdr = is_hdr;
-	result.paths = std::vector<std::string>(n_images, "");
+	result.wants_importance_sampling = true;
+	result.has_rays = false;
+	result.n_extra_learnable_dims = 0;
+	result.has_light_dirs = false;
+	result.render_aabb = render_aabb;
+	result.aabb_scale = aabb_scale;
+	result.xforms.resize(n_images);
 	for (size_t i = 0; i < n_images; ++i) {
 		result.xforms[i].start = Eigen::Matrix<float, 3, 4>::Identity();
 		result.xforms[i].end = Eigen::Matrix<float, 3, 4>::Identity();
@@ -321,8 +329,10 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 		uint32_t mask_color = 0;
 		void *pixels = nullptr;
 		uint16_t *depth_pixels = nullptr;
+		uint16_t *depth_cov_pixels = nullptr;
 		Ray *rays = nullptr;
 		float depth_scale = -1.f;
+		float depth_cov_scale = -1.f;
 	};
 	std::vector<LoadedImageInfo> images;
 	LoadedImageInfo info = {};
@@ -401,6 +411,7 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 	result.metadata.resize(result.n_images);
 	result.pixelmemory.resize(result.n_images);
 	result.depthmemory.resize(result.n_images);
+	result.depthcovmemory.resize(result.n_images);
 	result.raymemory.resize(result.n_images);
 
 	result.scale = NERF_SCALE;
@@ -545,167 +556,247 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 			}
 		}
 
-		if (json.contains("frames") && json["frames"].is_array()) pool.parallelForAsync<size_t>(0, json["frames"].size(), [&progress, &n_loaded, &result, &images, &json, basepath, image_idx, info, rolling_shutter, principal_point, lens, part_after_underscore, fix_premult, enable_depth_loading, enable_ray_loading](size_t i) {
-			size_t i_img = i + image_idx;
-			auto& frame = json["frames"][i];
-			LoadedImageInfo& dst = images[i_img];
-			dst = info; // copy defaults
+        if (json.contains("frames") && json["frames"].is_array()) {
+			pool.parallelForAsync<size_t>(
+				0,
+				json["frames"].size(),
+				[&progress,
+				&n_loaded,
+				&result,
+				&images,
+				&json,
+				basepath,
+				image_idx,
+				info,
+				rolling_shutter,
+				principal_point,
+				lens,
+				part_after_underscore,
+				fix_premult,
+				enable_depth_loading,
+				enable_ray_loading](size_t i) {
+					size_t i_img = i + image_idx;
+					auto& frame = json["frames"][i];
+					LoadedImageInfo& dst = images[i_img];
+					dst = info;  // copy defaults
 
-			std::string json_provided_path(frame["file_path"]);
-			if (json_provided_path == "") {
-				char buf[256];
-				snprintf(buf, 256, "%s_%03d/rgba.png", part_after_underscore.c_str(), (int)i);
-				json_provided_path = buf;
-			}
-			fs::path path = basepath / json_provided_path;
-
-			if (path.extension() == "") {
-				path = path.with_extension("png");
-				if (!path.exists()) {
-					path = path.with_extension("exr");
-				}
-				if (!path.exists()) {
-					throw std::runtime_error{"Could not find image file: " + path.str()};
-				}
-			}
-
-			int comp = 0;
-			if (equals_case_insensitive(path.extension(), "exr")) {
-				dst.pixels = load_exr_to_gpu(&dst.res.x(), &dst.res.y(), path.str().c_str(), fix_premult);
-				dst.image_type = EImageDataType::Half;
-				dst.image_data_on_gpu = true;
-				result.is_hdr = true;
-			} else {
-				dst.image_data_on_gpu = false;
-				uint8_t* img = stbi_load(path.str().c_str(), &dst.res.x(), &dst.res.y(), &comp, 4);
-				if (!img) {
-					throw std::runtime_error{"Could not open image file: "s + std::string{stbi_failure_reason()}};
-				}
-
-
-				fs::path alphapath = basepath / fmt::format("{}.alpha.{}", frame["file_path"], path.extension());
-				if (alphapath.exists()) {
-					int wa = 0, ha = 0;
-					uint8_t* alpha_img = stbi_load(alphapath.str().c_str(), &wa, &ha, &comp, 4);
-					if (!alpha_img) {
-						throw std::runtime_error{"Could not load alpha image "s + alphapath.str()};
+					std::string json_provided_path(frame["file_path"]);
+					if (json_provided_path == "") {
+						char buf[256];
+						snprintf(buf,
+								256,
+								"%s_%03d/rgba.png",
+								part_after_underscore.c_str(),
+								(int)i);
+						json_provided_path = buf;
 					}
-					ScopeGuard mem_guard{[&]() { stbi_image_free(alpha_img); }};
-					if (wa != dst.res.x() || ha != dst.res.y()) {
-						throw std::runtime_error{fmt::format("Alpha image {} has wrong resolution.", alphapath.str())};
-					}
-					tlog::success() << "Alpha loaded from " << alphapath;
-					for (int i = 0; i < dst.res.prod(); ++i) {
-						img[i*4+3] = (uint8_t)(255.0f*srgb_to_linear(alpha_img[i*4]*(1.f/255.f))); // copy red channel of alpha to alpha.png to our alpha channel
-					}
-				}
+					fs::path path = basepath / json_provided_path;
 
-				fs::path maskpath = path.parent_path()/(fmt::format("dynamic_mask_{}.png", path.basename()));
-				if (maskpath.exists()) {
-					int wa = 0, ha = 0;
-					uint8_t* mask_img = stbi_load(maskpath.str().c_str(), &wa, &ha, &comp, 4);
-					if (!mask_img) {
-						throw std::runtime_error{fmt::format("Dynamic mask {} could not be loaded.", maskpath.str())};
-					}
-					ScopeGuard mem_guard{[&]() { stbi_image_free(mask_img); }};
-					if (wa != dst.res.x() || ha != dst.res.y()) {
-						throw std::runtime_error{fmt::format("Dynamic mask {} has wrong resolution.", maskpath.str())};
-					}
-					dst.mask_color = 0x00FF00FF; // HOT PINK
-					for (int i = 0; i < dst.res.prod(); ++i) {
-						if (mask_img[i*4] != 0) {
-							*(uint32_t*)&img[i*4] = dst.mask_color;
+					if (path.extension() == "") {
+						path = path.with_extension("png");
+						if (!path.exists()) {
+						path = path.with_extension("exr");
+						}
+						if (!path.exists()) {
+						throw std::runtime_error{
+							"Could not find image file: " + path.str()};
 						}
 					}
-				}
 
-				dst.pixels = img;
-				dst.image_type = EImageDataType::Byte;
-			}
+					int comp = 0;
+					if (equals_case_insensitive(path.extension(), "exr")) {
+						dst.pixels = load_exr_to_gpu(&dst.res.x(), &dst.res.y(), path.str().c_str(), fix_premult);
+						dst.image_type = EImageDataType::Half;
+						dst.image_data_on_gpu = true;
+						result.is_hdr = true;
+					} else {
+						dst.image_data_on_gpu = false;
+						uint8_t* img = stbi_load(path.str().c_str(),
+												&dst.res.x(),
+												&dst.res.y(),
+												&comp,
+												4);
 
-			if (!dst.pixels) {
-				throw std::runtime_error{"Could not load image: " + path.str()};
-			}
+						fs::path alphapath =
+							basepath / fmt::format("{}.alpha.{}",
+													frame["file_path"],
+													path.extension());
+						if (alphapath.exists()) {
+						int wa = 0, ha = 0;
+						uint8_t* alpha_img = stbi_load(alphapath.str().c_str(), &wa, &ha, &comp, 4);
+						if (!alpha_img) {
+							throw std::runtime_error{ "Could not load alpha image "s + alphapath.str()};
+						}
+						ScopeGuard mem_guard{ [&]() { stbi_image_free(alpha_img); }};
+						if (wa != dst.res.x() || ha != dst.res.y()) {
+							throw std::runtime_error{fmt::format(
+								"Alpha image {} has wrong resolution.",
+								alphapath.str())};
+						}
+						tlog::success()
+							<< "Alpha loaded from " << alphapath;
+						for (int i = 0; i < dst.res.prod(); ++i) {
+							img[i * 4 + 3] = uint8_t(
+								255.0f *
+								srgb_to_linear(
+									alpha_img[i * 4] *
+									(1.f / 255.f)));  // copy red channel of
+													// alpha to alpha.png to
+													// our alpha channel
+						}
+						}
 
-			if (enable_depth_loading && info.depth_scale > 0.f && frame.contains("depth_path")) {
-				fs::path depthpath = basepath / std::string{frame["depth_path"]};
-				if (depthpath.exists()) {
-					int wa=0,ha=0;
-					dst.depth_pixels = stbi_load_16(depthpath.str().c_str(), &wa, &ha, &comp, 1);
-					if (!dst.depth_pixels) {
-						throw std::runtime_error{"Could not load depth image "s + depthpath.str()};
+						fs::path maskpath =
+							path.parent_path() /
+							(fmt::format("dynamic_mask_{}.png",
+										path.basename()));
+						if (maskpath.exists()) {
+						int wa = 0, ha = 0;
+						uint8_t* mask_img = stbi_load(
+							maskpath.str().c_str(), &wa, &ha, &comp, 4);
+						if (!mask_img) {
+							throw std::runtime_error{fmt::format(
+								"Dynamic mask {} could not be loaded.",
+								maskpath.str())};
+						}
+						ScopeGuard mem_guard{
+							[&]() { stbi_image_free(mask_img); }};
+						if (wa != dst.res.x() || ha != dst.res.y()) {
+							throw std::runtime_error{fmt::format(
+								"Dynamic mask {} has wrong resolution.",
+								maskpath.str())};
+						}
+						dst.mask_color = 0x00FF00FF;  // HOT PINK
+						for (int i = 0; i < dst.res.prod(); ++i) {
+							if (mask_img[i * 4] != 0) {
+							*(uint32_t*)&img[i * 4] = dst.mask_color;
+							}
+						}
+						}
+
+						dst.pixels = img;
+						dst.image_type = EImageDataType::Byte;
 					}
-					if (wa != dst.res.x() || ha != dst.res.y()) {
-						throw std::runtime_error{fmt::format("Depth image {} has wrong resolution.", depthpath.str())};
+
+					if (!dst.pixels) {
+						throw std::runtime_error{"image not found: " +
+												path.str()};
 					}
-					//tlog::success() << "Depth loaded from " << depthpath;
+
+					if (enable_depth_loading && info.depth_scale > 0.f &&
+						frame.contains("depth_path")) {
+						fs::path depthpath =
+							basepath / std::string{frame["depth_path"]};
+						if (depthpath.exists()) {
+						int wa = 0, ha = 0;
+						dst.depth_pixels = stbi_load_16(depthpath.str().c_str(), &wa, &ha, &comp, 1);
+						if (!dst.depth_pixels) {
+							throw std::runtime_error{
+								"Could not load depth image "s +
+								depthpath.str()};
+						}
+						if (wa != dst.res.x() || ha != dst.res.y()) {
+							throw std::runtime_error{fmt::format(
+								"Depth image {} has wrong resolution.",
+								depthpath.str())};
+						}
+						tlog::success() << "Depth loaded from " << depthpath;
+
+						tlog::success() << "Fake load depth cov...";
+						dst.depth_cov_pixels = stbi_load_16(depthpath.str().c_str(), &wa, &ha, &comp, 1);
+						if (!dst.depth_cov_pixels) {
+							throw std::runtime_error{"Could not load fake depth cov image "s + depthpath.str()};
+						}
+						}
+					}
+
+					fs::path rayspath =
+						path.parent_path() /
+						(fmt::format("rays_{}.dat", path.basename()));
+					if (enable_ray_loading && rayspath.exists()) {
+						uint32_t n_pixels = dst.res.prod();
+						dst.rays = (Ray*)malloc(n_pixels * sizeof(Ray));
+
+						std::ifstream rays_file{rayspath.str(),
+												std::ios::binary};
+						rays_file.read((char*)dst.rays,
+										n_pixels * sizeof(Ray));
+
+						std::streampos fsize = 0;
+						fsize = rays_file.tellg();
+						rays_file.seekg(0, std::ios::end);
+						fsize = rays_file.tellg() - fsize;
+
+						if (fsize > 0) {
+						tlog::warning()
+							<< fsize << " bytes remaining in rays file "
+							<< rayspath;
+						}
+
+						for (uint32_t px = 0; px < n_pixels; ++px) {
+						result.nerf_ray_to_ngp(dst.rays[px]);
+						}
+						result.has_rays = true;
+					}
+
+					nlohmann::json& jsonmatrix_start =
+						frame.contains("transform_matrix_start")
+							? frame["transform_matrix_start"]
+							: frame["transform_matrix"];
+					nlohmann::json& jsonmatrix_end =
+						frame.contains("transform_matrix_end")
+							? frame["transform_matrix_end"]
+							: jsonmatrix_start;
+
+					if (frame.contains("driver_parameters")) {
+						Eigen::Vector3f light_dir(
+							frame["driver_parameters"].value("LightX", 0.f),
+							frame["driver_parameters"].value("LightY", 0.f),
+							frame["driver_parameters"].value("LightZ", 0.f));
+						result.metadata[i_img].light_dir =
+							result.nerf_direction_to_ngp(
+								light_dir.normalized());
+						result.has_light_dirs = true;
+						result.n_extra_learnable_dims = 0;
+					}
+
+					bool got_fl = read_focal_length(
+						json, result.metadata[i_img].focal_length, dst.res);
+					got_fl |= read_focal_length(
+						frame,
+						result.metadata[i_img].focal_length,
+						dst.res);
+					if (!got_fl) {
+						throw std::runtime_error{"Couldn't read fov."};
+					}
+
+					for (int m = 0; m < 3; ++m) {
+						for (int n = 0; n < 4; ++n) {
+						result.xforms[i_img].start(m, n) = float(jsonmatrix_start[m][n]);
+						result.xforms[i_img].end(m, n) = float(jsonmatrix_end[m][n]);
+						}
+					}
+
+					// set these from the base settings
+					result.metadata[i_img].rolling_shutter = rolling_shutter;
+					result.metadata[i_img].principal_point = principal_point;
+					result.metadata[i_img].lens = lens;
+					// see if there is a per-frame override
+					read_lens(
+						frame,
+						result.metadata[i_img].lens,
+						result.metadata[i_img].principal_point,
+						result.metadata[i_img].rolling_shutter);
+
+					result.xforms[i_img].start = result.nerf_matrix_to_ngp(result.xforms[i_img].start);
+					result.xforms[i_img].end   = result.nerf_matrix_to_ngp(result.xforms[i_img].end);
+
+					progress.update(++n_loaded);
 				}
-			}
+			, futures);
+		}
 
-			fs::path rayspath = path.parent_path()/(fmt::format("rays_{}.dat", path.basename()));
-			if (enable_ray_loading && rayspath.exists()) {
-				uint32_t n_pixels = dst.res.prod();
-				dst.rays = (Ray*)malloc(n_pixels * sizeof(Ray));
-
-				std::ifstream rays_file{rayspath.str(), std::ios::binary};
-				rays_file.read((char*)dst.rays, n_pixels * sizeof(Ray));
-
-				std::streampos fsize = 0;
-				fsize = rays_file.tellg();
-				rays_file.seekg(0, std::ios::end);
-				fsize = rays_file.tellg() - fsize;
-
-				if (fsize > 0) {
-					tlog::warning() << fsize << " bytes remaining in rays file " << rayspath;
-				}
-
-				for (uint32_t px = 0; px < n_pixels; ++px) {
-					result.nerf_ray_to_ngp(dst.rays[px]);
-				}
-				result.has_rays = true;
-			}
-
-			nlohmann::json& jsonmatrix_start = frame.contains("transform_matrix_start") ? frame["transform_matrix_start"] : frame["transform_matrix"];
-			nlohmann::json& jsonmatrix_end = frame.contains("transform_matrix_end") ? frame["transform_matrix_end"] : jsonmatrix_start;
-
-			if (frame.contains("driver_parameters")) {
-				Eigen::Vector3f light_dir(
-					frame["driver_parameters"].value("LightX", 0.f),
-					frame["driver_parameters"].value("LightY", 0.f),
-					frame["driver_parameters"].value("LightZ", 0.f)
-				);
-				result.metadata[i_img].light_dir = result.nerf_direction_to_ngp(light_dir.normalized());
-				result.has_light_dirs = true;
-				result.n_extra_learnable_dims = 0;
-			}
-
-			bool got_fl = read_focal_length(json, result.metadata[i_img].focal_length, dst.res);
-			got_fl |= read_focal_length(frame, result.metadata[i_img].focal_length, dst.res);
-			if (!got_fl) {
-				throw std::runtime_error{"Couldn't read fov."};
-			}
-
-			for (int m = 0; m < 3; ++m) {
-				for (int n = 0; n < 4; ++n) {
-					result.xforms[i_img].start(m, n) = float(jsonmatrix_start[m][n]);
-					result.xforms[i_img].end(m, n) = float(jsonmatrix_end[m][n]);
-				}
-			}
-
-			// set these from the base settings
-			result.metadata[i_img].rolling_shutter = rolling_shutter;
-			result.metadata[i_img].principal_point = principal_point;
-			result.metadata[i_img].lens = lens;
-			// see if there is a per-frame override
-			read_lens(frame, result.metadata[i_img].lens, result.metadata[i_img].principal_point, result.metadata[i_img].rolling_shutter);
-
-			result.xforms[i_img].start = result.nerf_matrix_to_ngp(result.xforms[i_img].start);
-			result.xforms[i_img].end = result.nerf_matrix_to_ngp(result.xforms[i_img].end);
-
-			progress.update(++n_loaded);
-		}, futures);
-
-		if (json.contains("frames")) {
+        if (json.contains("frames")) {
 			image_idx += json["frames"].size();
 		}
 
@@ -729,7 +820,11 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 	// copy / convert images to the GPU
 	for (uint32_t i = 0; i < result.n_images; ++i) {
 		const LoadedImageInfo& m = images[i];
-		result.set_training_image(i, m.res, m.pixels, m.depth_pixels, m.depth_scale * result.scale, m.image_data_on_gpu, m.image_type, EDepthDataType::UShort, sharpen_amount, m.white_transparent, m.black_transparent, m.mask_color, m.rays);
+		// TODO add depth_cov!
+		result.set_training_image(i, m.res, m.pixels, m.depth_pixels, m.depth_cov_pixels,
+		 m.depth_scale * result.scale, m.depth_cov_scale * result.scale, m.image_data_on_gpu,
+		  m.image_type, EDepthDataType::UShort, EDepthDataType::UShort,
+		  sharpen_amount, m.white_transparent, m.black_transparent, m.mask_color, m.rays);
 		CUDA_CHECK_THROW(cudaDeviceSynchronize());
 	}
 	CUDA_CHECK_THROW(cudaDeviceSynchronize());
@@ -742,110 +837,257 @@ NerfDataset load_nerf(const std::vector<filesystem::path>& jsonpaths, float shar
 		}
 		free(images[i].rays);
 		free(images[i].depth_pixels);
+		free(images[i].depth_cov_pixels);
 	}
+
 	return result;
 }
 
-void NerfDataset::set_training_image(int frame_idx, const Eigen::Vector2i& image_resolution, const void* pixels, const void* depth_pixels, float depth_scale, bool image_data_on_gpu, EImageDataType image_type, EDepthDataType depth_type, float sharpen_amount, bool white_transparent, bool black_transparent, uint32_t mask_color, const Ray *rays) {
-	if (frame_idx < 0 || frame_idx >= n_images) {
-		throw std::runtime_error{"NerfDataset::set_training_image: invalid frame index"};
-	}
-	size_t n_pixels = image_resolution.prod();
-	size_t img_size = n_pixels * 4; // 4 channels
-	size_t image_type_stride = image_type_size(image_type);
-	// copy to gpu if we need to do a conversion
-	GPUMemory<uint8_t> images_data_gpu_tmp;
-	GPUMemory<uint8_t> depth_tmp;
-	if (!image_data_on_gpu && image_type == EImageDataType::Byte) {
-		images_data_gpu_tmp.resize(img_size * image_type_stride);
-		images_data_gpu_tmp.copy_from_host((uint8_t*)pixels);
-		pixels = images_data_gpu_tmp.data();
+void NerfDataset::set_training_image(int frame_idx,
+                                     const Eigen::Vector2i& image_resolution,
+                                     const void* pixels,
+                                     const void* depth_pixels,
+                                     const void* depth_cov_pixels,
+                                     float depth_scale,
+                                     float depth_cov_scale,
+                                     bool image_data_on_gpu,
+                                     EImageDataType image_type,
+                                     EDepthDataType depth_type,
+                                     EDepthDataType depth_cov_type,
+                                     float sharpen_amount,
+                                     bool white_transparent,
+                                     bool black_transparent,
+                                     uint32_t mask_color,
+                                     const Ray* rays) {
+  if (frame_idx < 0 || frame_idx >= n_images) {
+    throw std::runtime_error{
+        "NerfDataset::set_training_image: invalid frame index"};
+  }
 
-		if (depth_pixels) {
-			depth_tmp.resize(n_pixels * depth_type_size(depth_type));
-			depth_tmp.copy_from_host((uint8_t*)depth_pixels);
-			depth_pixels = depth_tmp.data();
+  size_t n_pixels = image_resolution.prod();
+
+  size_t image_size = n_pixels * 4;  // 4 channels
+  size_t depth_size = n_pixels * 1;  // 1 channel
+  size_t depth_cov_size = n_pixels * 1;  // 1 channel
+
+  size_t image_dtype_size = image_type_size(image_type);
+  size_t depth_dtype_size = depth_type_size(depth_type);
+  size_t depth_cov_dtype_size = depth_type_size(depth_type);
+
+  // copy to gpu if we need to do a conversion
+  GPUMemory<uint8_t> images_data_gpu_tmp;
+  if (!image_data_on_gpu && image_type == EImageDataType::Byte) {
+    images_data_gpu_tmp.resize(image_size * image_dtype_size);
+    images_data_gpu_tmp.copy_from_host((uint8_t*)pixels);
+    pixels = images_data_gpu_tmp.data();
+    image_data_on_gpu = true;
+  }
+
+  // copy or convert the pixels
+  pixelmemory[frame_idx].resize(image_size * image_dtype_size);
+  void* dst = pixelmemory[frame_idx].data();
+
+  switch (image_type) {
+    case EImageDataType::Byte: {
+		// Convert instead of copy
+		linear_kernel(convert_rgba32,
+						0,
+						nullptr,
+						n_pixels,
+						(uint8_t*)pixels,
+						(uint8_t*)dst,
+						white_transparent,
+						black_transparent,
+						mask_color);
+	    break;
+    }
+    case EImageDataType::Half:  // fallthrough is intended
+    case EImageDataType::Float: {
+        CUDA_CHECK_THROW(cudaMemcpy(dst,
+                                    pixels,
+                                    image_size * image_dtype_size,
+                                    image_data_on_gpu
+                                        ? cudaMemcpyDeviceToDevice
+                                        : cudaMemcpyHostToDevice));
+        break;
+    }
+    default: {
+      throw std::runtime_error{"unknown image type in set_training_image"};
+    }
+  }
+
+  // copy over depths if provided
+  if (depth_scale >= 0.f && depth_pixels) {
+
+	GPUMemory<uint8_t> depth_data_gpu_tmp;
+	if (true) {
+		depth_data_gpu_tmp.resize(depth_size * depth_dtype_size);
+		depth_data_gpu_tmp.copy_from_host((uint8_t*)depth_pixels);
+		depth_pixels = depth_data_gpu_tmp.data();
+	}
+
+    depthmemory[frame_idx].resize(depth_size * depth_dtype_size);
+    float* depth_dst = depthmemory[frame_idx].data();
+
+    switch (depth_type) {
+      case EDepthDataType::UShort: {
+        linear_kernel(copy_depth<uint16_t>,
+                      0,
+                      nullptr,
+                      n_pixels,
+                      depth_dst,
+                      (const uint16_t*)depth_pixels,
+                      depth_scale);
+        break;
+      }
+      case EDepthDataType::Float: {
+        linear_kernel(copy_depth<float>,
+                      0,
+                      nullptr,
+                      n_pixels,
+                      depth_dst,
+                      (const float*)depth_pixels,
+                      depth_scale);
+        break;
+      }
+      default: {
+        throw std::runtime_error{"unknown depth type in set_training_image"};
+      }
+    }
+
+	// copy over depth_cov if provided and if depth_scale >=0.0
+	if (depth_cov_scale >= 0.f && depth_cov_pixels) {
+		GPUMemory<uint8_t> depth_cov_data_gpu_tmp;
+		if (true) {
+			depth_cov_data_gpu_tmp.resize(depth_cov_size * depth_cov_dtype_size);
+			depth_cov_data_gpu_tmp.copy_from_host((uint8_t*)depth_cov_pixels);
+			depth_cov_pixels = depth_cov_data_gpu_tmp.data();
 		}
 
-		image_data_on_gpu = true;
-	}
-
-	// copy or convert the pixels
-	pixelmemory[frame_idx].resize(img_size * image_type_size(image_type));
-	void* dst = pixelmemory[frame_idx].data();
-
-	switch (image_type) {
-		default: throw std::runtime_error{"unknown image type in set_training_image"};
-		case EImageDataType::Byte: linear_kernel(convert_rgba32, 0, nullptr, n_pixels, (uint8_t*)pixels, (uint8_t*)dst, white_transparent, black_transparent, mask_color); break;
-		case EImageDataType::Half: // fallthrough is intended
-		case EImageDataType::Float: CUDA_CHECK_THROW(cudaMemcpy(dst, pixels, img_size * image_type_size(image_type), image_data_on_gpu ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice)); break;
-	}
-
-	// copy over depths if provided
-	if (depth_scale >= 0.f) {
-		depthmemory[frame_idx].resize(img_size);
-		float* depth_dst = depthmemory[frame_idx].data();
-
-		if (depth_pixels && !image_data_on_gpu) {
-			depth_tmp.resize(n_pixels * depth_type_size(depth_type));
-			depth_tmp.copy_from_host((uint8_t*)depth_pixels);
-			depth_pixels = depth_tmp.data();
-		}
+		depthcovmemory[frame_idx].resize(depth_cov_size * depth_cov_dtype_size);
+		float* depth_cov_dst = depthcovmemory[frame_idx].data();
 
 		switch (depth_type) {
-			default: throw std::runtime_error{"unknown depth type in set_training_image"};
-			case EDepthDataType::UShort: linear_kernel(copy_depth<uint16_t>, 0, nullptr, n_pixels, depth_dst, (const uint16_t*)depth_pixels, depth_scale); break;
-			case EDepthDataType::Float: linear_kernel(copy_depth<float>, 0, nullptr, n_pixels, depth_dst, (const float*)depth_pixels, depth_scale); break;
+			case EDepthDataType::UShort: {
+				linear_kernel(copy_depth<uint16_t>,
+							0,
+							nullptr,
+							n_pixels,
+							depth_cov_dst,
+							(const uint16_t*)depth_cov_pixels,
+							depth_cov_scale);
+				break;
+			}
+			case EDepthDataType::Float: {
+				linear_kernel(copy_depth<float>,
+							0,
+							nullptr,
+							n_pixels,
+							depth_cov_dst,
+							(const float*)depth_cov_pixels,
+							depth_cov_scale);
+				break;
+			}
+			default: {
+				throw std::runtime_error{"unknown depth cov type in set_training_image"};
+			}
 		}
 	} else {
-		depthmemory[frame_idx].free_memory();
+	   depthcovmemory[frame_idx].free_memory();
 	}
+  } else {
+    depthmemory[frame_idx].free_memory();
+	depthcovmemory[frame_idx].free_memory();
+  }
 
-	// apply requested sharpening
-	if (sharpen_amount > 0.f) {
-		if (image_type == EImageDataType::Byte) {
-			tcnn::GPUMemory<uint8_t> images_data_half(img_size * sizeof(__half));
-			linear_kernel(from_rgba32<__half>, 0, nullptr, n_pixels, (uint8_t*)pixels, (__half*)images_data_half.data(), white_transparent, black_transparent, mask_color);
-			pixelmemory[frame_idx] = std::move(images_data_half);
-			dst = pixelmemory[frame_idx].data();
-			image_type = EImageDataType::Half;
-		}
+  // apply requested sharpening
+  if (sharpen_amount > 0.f) {
+    if (image_type == EImageDataType::Byte) {
+      tcnn::GPUMemory<uint8_t> images_data_half(image_size * sizeof(__half));
+      linear_kernel(from_rgba32<__half>,
+                    0,
+                    nullptr,
+                    n_pixels,
+                    (uint8_t*)pixels,
+                    (__half*)images_data_half.data(),
+                    white_transparent,
+                    black_transparent,
+                    mask_color);
+      pixelmemory[frame_idx] = std::move(images_data_half);
+      dst = pixelmemory[frame_idx].data();
+      image_type = EImageDataType::Half;
+    }
 
-		assert(image_type == EImageDataType::Half || image_type == EImageDataType::Float);
+    assert(image_type == EImageDataType::Half ||
+           image_type == EImageDataType::Float);
 
-		tcnn::GPUMemory<uint8_t> images_data_sharpened(img_size * image_type_size(image_type));
+    tcnn::GPUMemory<uint8_t> images_data_sharpened(image_size *
+                                                   image_type_size(image_type));
 
-		float center_w = 4.f + 1.f / sharpen_amount; // center_w ranges from 5 (strong sharpening) to infinite (no sharpening)
-		if (image_type == EImageDataType::Half) {
-			linear_kernel(sharpen<__half>, 0, nullptr, n_pixels, image_resolution.x(), (__half*)dst, (__half*)images_data_sharpened.data(), center_w, 1.f / (center_w - 4.f));
-		} else {
-			linear_kernel(sharpen<float>, 0, nullptr, n_pixels, image_resolution.x(), (float*)dst, (float*)images_data_sharpened.data(), center_w, 1.f / (center_w - 4.f));
-		}
+    float center_w =
+        4.f + 1.f / sharpen_amount;  // center_w ranges from 5 (strong
+                                     // sharpening) to infinite (no sharpening)
+    if (image_type == EImageDataType::Half) {
+      linear_kernel(sharpen<__half>,
+                    0,
+                    nullptr,
+                    n_pixels,
+                    image_resolution.x(),
+                    (__half*)dst,
+                    (__half*)images_data_sharpened.data(),
+                    center_w,
+                    1.f / (center_w - 4.f));
+    } else {
+      linear_kernel(sharpen<float>,
+                    0,
+                    nullptr,
+                    n_pixels,
+                    image_resolution.x(),
+                    (float*)dst,
+                    (float*)images_data_sharpened.data(),
+                    center_w,
+                    1.f / (center_w - 4.f));
+    }
 
-		pixelmemory[frame_idx] = std::move(images_data_sharpened);
-		dst = pixelmemory[frame_idx].data();
-	}
+    pixelmemory[frame_idx] = std::move(images_data_sharpened);
+    dst = pixelmemory[frame_idx].data();
+  }
 
-	if (sharpness_data.size() > 0) {
-		// compute overall sharpness
-		const dim3 threads = { 16, 8, 1 };
-		const dim3 blocks = { div_round_up((uint32_t)sharpness_resolution.x(), threads.x), div_round_up((uint32_t)sharpness_resolution.y(), threads.y), 1 };
-		sharpness_data.enlarge(sharpness_resolution.x() * sharpness_resolution.y());
-		compute_sharpness<<<blocks, threads, 0, nullptr>>>(sharpness_resolution, image_resolution, 1, dst, image_type, sharpness_data.data() + sharpness_resolution.x() * sharpness_resolution.y() * (size_t)frame_idx);
-	}
+  if (sharpness_data.size() > 0) {
+    // compute overall sharpness
+    const dim3 threads = {16, 8, 1};
+    const dim3 blocks = {
+        div_round_up((uint32_t)sharpness_resolution.x(), threads.x),
+        div_round_up((uint32_t)sharpness_resolution.y(), threads.y),
+        1};
+    sharpness_data.enlarge(sharpness_resolution.x() * sharpness_resolution.y());
+    compute_sharpness<<<blocks, threads, 0, nullptr>>>(
+        sharpness_resolution,
+        image_resolution,
+        1,
+        dst,
+        image_type,
+        sharpness_data.data() + sharpness_resolution.x() *
+                                    sharpness_resolution.y() *
+                                    (size_t)frame_idx);
+  }
 
-	metadata[frame_idx].pixels = pixelmemory[frame_idx].data();
-	metadata[frame_idx].depth = depthmemory[frame_idx].data();
-	metadata[frame_idx].resolution = image_resolution;
-	metadata[frame_idx].image_data_type = image_type;
-	if (rays) {
-		raymemory[frame_idx].resize(n_pixels);
-		CUDA_CHECK_THROW(cudaMemcpy(raymemory[frame_idx].data(), rays, n_pixels * sizeof(Ray), cudaMemcpyHostToDevice));
-	} else {
-		raymemory[frame_idx].free_memory();
-	}
-	metadata[frame_idx].rays = raymemory[frame_idx].data();
-	update_metadata(frame_idx, frame_idx + 1);
+  metadata[frame_idx].pixels          = pixelmemory[frame_idx].data();
+  metadata[frame_idx].depth           = depthmemory[frame_idx].data();
+  metadata[frame_idx].depth_cov       = depthcovmemory[frame_idx].data();
+  metadata[frame_idx].resolution      = image_resolution;
+  metadata[frame_idx].image_data_type = image_type;
+  if (rays) {
+    raymemory[frame_idx].resize(n_pixels);
+    CUDA_CHECK_THROW(cudaMemcpy(raymemory[frame_idx].data(),
+                                rays,
+                                n_pixels * sizeof(Ray),
+                                cudaMemcpyHostToDevice));
+  } else {
+    raymemory[frame_idx].free_memory();
+  }
+  metadata[frame_idx].rays = raymemory[frame_idx].data();
+  update_metadata(frame_idx, frame_idx + 1);
 }
 
 void NerfDataset::update_metadata(int first, int last) {
@@ -859,7 +1101,7 @@ void NerfDataset::update_metadata(int first, int last) {
 
 	int n = last - first;
 	if (n <= 0) {
-		return;
+		throw std::runtime_error{fmt::format("Invalid metadata update call: first: {}, last: {}", first, last)};
 	}
 
 	metadata_gpu.enlarge(last);
