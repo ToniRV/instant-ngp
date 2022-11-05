@@ -39,6 +39,8 @@
 
 #include <thread>
 
+#include <unordered_map>
+
 struct GLFWwindow;
 
 TCNN_NAMESPACE_BEGIN
@@ -60,12 +62,11 @@ class GLTexture;
 
 class Testbed {
 public:
-	EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-	Testbed(ETestbedMode mode);
+	Testbed(ETestbedMode mode, int device);
 	~Testbed();
-	Testbed(ETestbedMode mode, const std::string& data_path) : Testbed(mode) { load_training_data(data_path); }
-	Testbed(ETestbedMode mode, const std::string& data_path, const std::string& network_config_path) : Testbed(mode, data_path) { reload_network_from_file(network_config_path); }
-	Testbed(ETestbedMode mode, const std::string& data_path, const nlohmann::json& network_config) : Testbed(mode, data_path) { reload_network_from_json(network_config); }
+	Testbed(ETestbedMode mode, int device, const std::string& data_path) : Testbed(mode, device) { load_training_data(data_path); }
+	Testbed(ETestbedMode mode, int device, const std::string& data_path, const std::string& network_config_path) : Testbed(mode, device, data_path) { reload_network_from_file(network_config_path); }
+	Testbed(ETestbedMode mode, int device, const std::string& data_path, const nlohmann::json& network_config) : Testbed(mode, device, data_path) { reload_network_from_json(network_config); }
 	void load_training_data(const std::string& data_path);
 	void clear_training_data();
 
@@ -293,9 +294,12 @@ public:
 	bool reprojection_available() { return m_dlss; }
 	static ELossType string_to_loss_type(const std::string& str);
 	void reset_network(bool clear_density_grid = true);
-	void create_empty_nerf_dataset(size_t n_images, int aabb_scale = 1, bool is_hdr = false);
+	void create_empty_nerf_dataset(size_t n_images, float nerf_scale, Eigen::Vector3f nerf_offset, int aabb_scale, BoundingBox render_aabb, bool is_hdr = false);
 	void load_nerf();
 	void load_nerf_post();
+	void update_pose(uint32_t frame_idx, const Eigen::Matrix<float, 3, 4>& new_pose);
+	void perturb_poses(float perturb_amount);
+	void perturb_transforms(float perturb_amount);
 	void load_mesh();
 	void set_exposure(float exposure) { m_exposure = exposure; }
 	void set_max_level(float maxlevel);
@@ -534,10 +538,12 @@ public:
 	struct Nerf {
 		NerfTracer tracer;
 
+
 		struct Training {
 			NerfDataset dataset;
 			int n_images_for_training = 0; // how many images to train from, as a high watermark compared to the dataset size
 			int n_images_for_training_prev = 0; // how many images we saw last time we updated the density grid
+			std::unordered_map<int, int> ref_frames;
 
 			struct ErrorMap {
 				tcnn::GPUMemory<float> data;
@@ -611,10 +617,13 @@ public:
 
 			float near_distance = 0.2f;
 			float density_grid_decay = 0.95f;
-			default_rng_t density_grid_rng;
 			int view = 0;
 
-			float depth_supervision_lambda = 0.f;
+			float depth_supervision_lambda = 1.f;
+
+			float perturb_pose_amount = 0.0f; // Perturbs initial poses
+			float perturb_transform_amount = 0.0f; // Perturbs optimized transform from initial pose to optimized pose
+			float perturb_depth_amount = 0.0f; // Perturbs depth images
 
 			tcnn::GPUMemory<float> sharpness_grid;
 
@@ -625,7 +634,24 @@ public:
 			void update_transforms(int first = 0, int last = -1);
 
 #ifdef NGP_PYTHON
-			void set_image(int frame_idx, pybind11::array_t<float> img, pybind11::array_t<float> depth_img, float depth_scale);
+			void update_training_images(
+				const std::vector<uint32_t>& frame_ids, 			  // (N,1)
+				const std::vector<Eigen::Matrix<float, 3, 4>>& poses, // (N,3,4)
+				const std::vector<pybind11::array_t<float>>& images,  // (N,H,W,4)
+				const std::vector<pybind11::array_t<float>>& depths,  // (N,H,W,3)
+				const std::vector<pybind11::array_t<float>>& depths_cov, // (N,H,W,3)
+				const Eigen::Vector2i& resolution,                    // (W,H)
+				const Eigen::Vector2f& principal_point,               // (cx,cy)
+				const Eigen::Vector2f& focal_length,                  // (fx,fy)
+				float depth_scale,
+				float depth_cov_scale);
+
+			void set_image(int frame_idx,
+							pybind11::array_t<float> img,
+							pybind11::array_t<float> depth_img,
+							pybind11::array_t<float> depth_cov,
+							float depth_scale,
+							float depth_cov_scale);
 #endif
 
 			void reset_camera_extrinsics();
@@ -809,6 +835,7 @@ public:
 	std::chrono::time_point<std::chrono::steady_clock> m_last_frame_time_point;
 	std::chrono::time_point<std::chrono::steady_clock> m_last_gui_draw_time_point;
 	std::chrono::time_point<std::chrono::steady_clock> m_training_start_time_point;
+	float m_elapsed_training_time = 0.0f;
 	Eigen::Array4f m_background_color = {0.0f, 0.0f, 0.0f, 1.0f};
 
 	bool m_vsync = false;
